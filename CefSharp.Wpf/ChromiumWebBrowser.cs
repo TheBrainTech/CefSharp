@@ -1546,6 +1546,8 @@ namespace CefSharp.Wpf
                         window.StateChanged += WindowStateChanged;
                         window.LocationChanged += OnWindowLocationChanged;
                     }
+
+                    updateBrowserScreenLocation();
                 }
             }
             else if (args.OldSource != null)
@@ -1587,11 +1589,19 @@ namespace CefSharp.Wpf
             } 
         }
 
+        private void updateBrowserScreenLocation()
+        {
+            if (PresentationSource.FromVisual(this) != null)
+            {
+                browserScreenLocation = PointToScreen(new Point());
+            }
+        }
+
         private void OnWindowLocationChanged(object sender, EventArgs e)
         {
             //We maintain a manual reference to the controls screen location
             //(relative to top/left of the screen)
-            browserScreenLocation = PointToScreen(new Point());
+            updateBrowserScreenLocation();
         }
 
         /// <summary>
@@ -1764,7 +1774,7 @@ namespace CefSharp.Wpf
             tooltipTimer.IsEnabled = false;
 
             //Initial value for screen location
-            browserScreenLocation = PointToScreen(new Point());
+            updateBrowserScreenLocation();
         }
 
         /// <summary>

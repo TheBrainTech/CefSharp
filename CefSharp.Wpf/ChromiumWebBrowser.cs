@@ -19,6 +19,8 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using CefSharp.ModelBinding;
 using System.Runtime.CompilerServices;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace CefSharp.Wpf
 {
@@ -63,10 +65,6 @@ namespace CefSharp.Wpf
         /// </summary>
         private int browserInitialized;
         /// <summary>
-        /// The matrix
-        /// </summary>
-        private Matrix matrix;
-        /// <summary>
         /// The image that represents this browser instances
         /// </summary>
         private Image image;
@@ -86,6 +84,17 @@ namespace CefSharp.Wpf
         /// The dispose count
         /// </summary>
         private int disposeCount;
+        /// <summary>
+        /// Location of the control on the screen, relative to Top/Left
+        /// Used to calculate GetScreenPoint
+        /// We're unable to call PointToScreen directly due to treading restrictions
+        /// and calling in a sync fashion on the UI thread was problematic.
+        /// </summary>
+        private Point browserScreenLocation;
+
+
+        private OsrImeWin _imeWin;
+
         /// <summary>
         /// A flag that indicates whether or not the designer is active
         /// NOTE: Needs to be static for OnApplicationExit
@@ -340,6 +349,13 @@ namespace CefSharp.Wpf
         public bool CanExecuteJavascriptInMainFrame { get; private set; }
 
         /// <summary>
+        /// The dpi scale factor, if the browser has already been initialized
+        /// you must manually call IBrowserHost.NotifyScreenInfoChanged for the
+        /// browser to be notified of the change.
+        /// </summary>
+        public double DpiScaleFactor { get; set; }
+
+        /// <summary>
         /// Initializes static members of the <see cref="ChromiumWebBrowser"/> class.
         /// </summary>
         static ChromiumWebBrowser()
@@ -353,7 +369,19 @@ namespace CefSharp.Wpf
                     app.Exit += OnApplicationExit;
                 }
             }
-        }
+			InputMethod.IsInputMethodEnabledProperty.OverrideMetadata(
+				typeof(ChromiumWebBrowser),
+				new FrameworkPropertyMetadata(true,FrameworkPropertyMetadataOptions.Inherits,(obj, e) => {
+					var browser = obj as ChromiumWebBrowser;
+					if((bool)e.NewValue && browser.browser != null && Keyboard.FocusedElement == browser) {
+						browser.browser.GetHost().SendFocusEvent(true);
+						InputMethod.SetIsInputMethodSuspended(browser, true);
+					}
+				}));
+			InputMethod.IsInputMethodSuspendedProperty.OverrideMetadata(
+				typeof(ChromiumWebBrowser),new FrameworkPropertyMetadata(true, FrameworkPropertyMetadataOptions.Inherits)
+				);
+		}
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ChromiumWebBrowser"/> class.
@@ -438,7 +466,7 @@ namespace CefSharp.Wpf
 
             PresentationSource.AddSourceChangedHandler(this, PresentationSourceChangedHandler);
 
-            RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.HighQuality);
+            RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.NearestNeighbor);
         }
 
         /// <summary>
@@ -539,6 +567,12 @@ namespace CefSharp.Wpf
                     {
                         SetCurrentValue(IsBrowserInitializedProperty, false);
                         WebBrowser = null;
+
+                        if (_imeWin != null)
+                        {
+                            _imeWin.Dispose();
+                            _imeWin = null;
+                        }
                     });
                 }
 
@@ -559,8 +593,16 @@ namespace CefSharp.Wpf
         /// <returns>ScreenInfo.</returns>
         ScreenInfo IRenderWebBrowser.GetScreenInfo()
         {
-            var screenInfo = new ScreenInfo(scaleFactor: (float)matrix.M11);            
+            return GetScreenInfo();
+        }
 
+        /// <summary>
+        /// Gets the ScreenInfo - currently used to get the DPI scale factor.
+        /// </summary>
+        /// <returns>ScreenInfo containing the current DPI scale factor</returns>
+        protected virtual ScreenInfo GetScreenInfo()
+        {
+            var screenInfo = new ScreenInfo(scaleFactor: (float)DpiScaleFactor);
             return screenInfo;
         }
 
@@ -580,19 +622,18 @@ namespace CefSharp.Wpf
             screenX = 0;
             screenY = 0;
 
-            var point = new Point(viewX, viewY);
-
-            UiThreadRunSync(() =>
+            //We manually claculate the screen point as calling PointToScreen can only be called on the UI thread
+            // in a sync fashion and it's easy for users to get themselves into a deadlock.
+            if(DpiScaleFactor > 1)
+            { 
+                screenX = (int)(browserScreenLocation.X + (viewX * DpiScaleFactor));
+                screenY = (int)(browserScreenLocation.Y + (viewY * DpiScaleFactor));
+            }
+            else
             {
-                point = PointToScreen(point);
-
-                PresentationSource source = PresentationSource.FromVisual(this);
-
-                point = matrix.Transform(point);
-            });
-
-            screenX = (int)point.X;
-            screenY = (int)point.Y;
+                screenX = (int)(browserScreenLocation.X + viewX);
+                screenY = (int)(browserScreenLocation.Y + viewY);
+            }
 
             return true;
         }
@@ -609,7 +650,7 @@ namespace CefSharp.Wpf
             {
                 throw new Exception("BitmapFactory cannot be null");
             }
-            return BitmapFactory.CreateBitmap(isPopup, matrix.M11);
+            return BitmapFactory.CreateBitmap(isPopup, DpiScaleFactor);
         }
 
         /// <summary>
@@ -741,6 +782,24 @@ namespace CefSharp.Wpf
         void IRenderWebBrowser.OnImeCompositionRangeChanged(Range selectedRange, Rect[] characterBounds)
         {
             //TODO: Implement this
+            if (_imeWin != null)
+            {
+                UiThreadRunAsync(() =>
+                {
+                    IList<Rect> rects = new List<Rect>();
+                    foreach (var item in characterBounds)
+                    {
+                        GeneralTransform generalTransform1 = TransformToAncestor(this);
+
+                        if (CleanupElement != null)
+                        {
+                            Point point = this.TransformToAncestor(CleanupElement).Transform(new Point(0, 0));
+                            rects.Add(new Rect((int)(point.X + item.X), (int)(point.Y + item.Y), item.Width, item.Height));
+                        }
+                    }
+                    _imeWin.OnImeCompositionRangeChanged(selectedRange, rects.ToArray());
+                });
+            }
         }
 
         /// <summary>
@@ -902,7 +961,7 @@ namespace CefSharp.Wpf
                 if (!IsDisposed)
                 {
                     SetCurrentValue(IsBrowserInitializedProperty, true);
-
+					HwndSource source = (HwndSource)PresentationSource.FromVisual(this);
                     // If Address was previously set, only now can we actually do the load
                     if (!string.IsNullOrEmpty(Address))
                     {
@@ -1468,25 +1527,71 @@ namespace CefSharp.Wpf
 
                 if (source != null)
                 {
-                    var notifyDpiChanged = !matrix.Equals(source.CompositionTarget.TransformToDevice);
+                    var matrix = source.CompositionTarget.TransformToDevice;
+                    var notifyDpiChanged = DpiScaleFactor > 0 && !DpiScaleFactor.Equals(matrix.M11);
 
-                    matrix = source.CompositionTarget.TransformToDevice;
+                    DpiScaleFactor = source.CompositionTarget.TransformToDevice.M11;
                     sourceHook = SourceHook;
                     source.AddHook(sourceHook);
 
-                    if (notifyDpiChanged)
+                    if (notifyDpiChanged && browser != null)
                     {
-                        if(browser != null)
-                        {
-                            browser.GetHost().NotifyScreenInfoChanged();
-                        }
+                        browser.GetHost().NotifyScreenInfoChanged();
+                    }
+
+
+                    var window = source.RootVisual as Window;
+                    if(window != null)
+                    {
+                        window.StateChanged += WindowStateChanged;
+                        window.LocationChanged += OnWindowLocationChanged;
                     }
                 }
             }
             else if (args.OldSource != null)
             {
                 RemoveSourceHook();
+
+                var window = args.OldSource.RootVisual as Window;
+                if (window != null)
+                {
+                    window.StateChanged -= WindowStateChanged;
+                    window.LocationChanged -= OnWindowLocationChanged;
+                }
             }
+        }
+
+        private void WindowStateChanged(object sender, EventArgs e)
+        {
+            var window = (Window)sender;
+
+            switch (window.WindowState)
+            {
+                case WindowState.Normal:
+                case WindowState.Maximized:
+                {
+                    if (browser != null)
+                    {
+                        browser.GetHost().WasHidden(false);
+                    }
+                    break;
+                }
+                case WindowState.Minimized:
+                {
+                    if (browser != null)
+                    {
+                        browser.GetHost().WasHidden(true);
+                    }
+                    break;
+                }
+            } 
+        }
+
+        private void OnWindowLocationChanged(object sender, EventArgs e)
+        {
+            //We maintain a manual reference to the controls screen location
+            //(relative to top/left of the screen)
+            browserScreenLocation = PointToScreen(new Point());
         }
 
         /// <summary>
@@ -1585,9 +1690,8 @@ namespace CefSharp.Wpf
         private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs args)
         {
             var isVisible = (bool)args.NewValue;
-
-            if (browser != null)
-            {
+			if(browser != null) {
+				HwndSource source = (HwndSource)PresentationSource.FromVisual(this);
                 browser.GetHost().WasHidden(!isVisible);
             }
         }
@@ -1615,6 +1719,29 @@ namespace CefSharp.Wpf
             Cef.Shutdown();
         }
 
+        protected override void OnGotFocus(RoutedEventArgs e)
+        {
+			InputMethod.SetIsInputMethodEnabled(this, false);
+			InputMethod.SetIsInputMethodSuspended(this, false);
+			base.OnGotFocus(e);
+			if(_imeWin == null && browser != null && source != null) {
+				_imeWin = new OsrImeWin(source.Handle, browser);
+			}
+			InputMethod.SetIsInputMethodEnabled(this, true);
+            InputMethod.SetIsInputMethodSuspended(this, true);
+        }
+
+        protected override void OnLostFocus(RoutedEventArgs e)
+        {
+            base.OnLostFocus(e);
+            InputMethod.SetIsInputMethodEnabled(this, false);
+            InputMethod.SetIsInputMethodSuspended(this, false);
+			if(_imeWin != null) {
+				_imeWin.Dispose();
+				_imeWin = null;
+			}
+        }
+
         /// <summary>
         /// Handles the <see cref="E:Loaded" /> event.
         /// </summary>
@@ -1635,6 +1762,9 @@ namespace CefSharp.Wpf
                 Dispatcher
                 );
             tooltipTimer.IsEnabled = false;
+
+            //Initial value for screen location
+            browserScreenLocation = PointToScreen(new Point());
         }
 
         /// <summary>
@@ -1714,37 +1844,15 @@ namespace CefSharp.Wpf
                 return IntPtr.Zero;
             }
 
-            switch ((WM)message)
+            if (_imeWin != null && !IsDisposed && IsKeyboardFocused && browser != null)
             {
-                case WM.SYSCHAR:
-                case WM.SYSKEYDOWN:
-                case WM.SYSKEYUP:
-                case WM.KEYDOWN:
-                case WM.KEYUP:
-                case WM.CHAR:
-                case WM.IME_CHAR:
-                { 
-                    if (!IsKeyboardFocused)
-                    {
-                        break;
-                    }
-
-                    if (message == (int)WM.SYSKEYDOWN &&
-                        wParam.ToInt32() == KeyInterop.VirtualKeyFromKey(Key.F4))
-                    {
-                        // We don't want CEF to receive this event (and mark it as handled), since that makes it impossible to
-                        // shut down a CefSharp-based app by pressing Alt-F4, which is kind of bad.
-                        return IntPtr.Zero;
-                    }
-
-                    if (browser != null)
-                    {
-                        browser.GetHost().SendKeyEvent(message, wParam.CastToInt32(), lParam.CastToInt32());    
-                        handled = true;
-                    }
-
-                    break;
+                var rel = _imeWin.WndProcHandler(hWnd, message, wParam, lParam);
+                if (rel == IntPtr.Zero)
+                {
+                    handled = true;
                 }
+
+                return rel;
             }
 
             return IntPtr.Zero;
@@ -1776,8 +1884,8 @@ namespace CefSharp.Wpf
 
             var popupOffset = new Point(x, y);
             var locationFromScreen = PointToScreen(popupOffset);
-            popup.HorizontalOffset = locationFromScreen.X / matrix.M11;
-            popup.VerticalOffset = locationFromScreen.Y / matrix.M22;
+            popup.HorizontalOffset = locationFromScreen.X / DpiScaleFactor;
+            popup.VerticalOffset = locationFromScreen.Y / DpiScaleFactor;
         }
 
         /// <summary>

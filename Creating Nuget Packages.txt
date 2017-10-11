@@ -1,0 +1,11 @@
+Instructions to create Nuget Packages for CefSharp after custom changes.
+
+1) Build the project in release mode for both x86 and x64
+2) Download Nuget.exe to create nuget packages
+3) From commandline go to the location of nuget and use command : nuget pack <path to nuspec file which are in cefsharp "Nuget" folder> \<version>
+
+Most probably you will only need Cefsharp.Common and Cefsharp.wpf. Make sure to specify cef versions in cefsharp.common nuget.
+Also make sure to use the newly built browsersubprocess.exe
+
+Put the nuget packages in Brain Box Engineering-> Nuget folder for everyone to access from.
+Also, copy the packages to TheBrainNet->NugetLocal foolder as this is the source set in nuget.config of the project.
